@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import subprocess
 from unittest.mock import patch, MagicMock
-from pathlib import Path
 
 from aidb_locator.adb import AdbClient, AdbError, Device
 
@@ -67,3 +66,21 @@ class TestListDevices:
         client = AdbClient()
         devices = client.list_devices()
         assert devices == []
+
+
+class TestEmulatorScreenshot:
+    @patch("aidb_locator.adb.subprocess.run")
+    def test_emulator_screenshot(self, mock_run, tmp_path):
+        output = tmp_path / "shot.png"
+
+        def fake_run(cmd, **kwargs):
+            output.write_bytes(b"\x89PNG\r\n\x1a\nDATA")
+            return MagicMock(returncode=0, stdout="OK\n", stderr="")
+
+        mock_run.side_effect = fake_run
+        client = AdbClient()
+        result = client.emulator_screenshot(output)
+
+        assert result == output
+        args = mock_run.call_args[0][0]
+        assert args == ["adb", "emu", "screenrecord", "screenshot", str(output)]

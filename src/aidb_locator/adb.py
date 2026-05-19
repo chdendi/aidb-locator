@@ -70,6 +70,15 @@ class AdbClient:
             raise AdbError(f"Pull succeeded but file not found: {local}")
         return local
 
+    def emulator_screenshot(self, local_path: str | Path) -> Path:
+        """Take a host-side emulator screenshot."""
+        local = Path(local_path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        self._run(["emu", "screenrecord", "screenshot", str(local)])
+        if not local.exists():
+            raise AdbError(f"Emulator screenshot succeeded but file not found: {local}")
+        return local
+
     def list_devices(self) -> list[Device]:
         """List connected ADB devices."""
         output = self._run(["devices"])

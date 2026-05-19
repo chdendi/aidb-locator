@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import struct
 import tempfile
+import zlib
 from pathlib import Path
 
-from aidb_locator.adb import AdbClient
+from aidb_locator.adb import AdbClient, AdbError
 from aidb_locator.models import (
     WApplication,
     WFile,
@@ -157,7 +159,13 @@ class NativeAdb:
         self._adb.shell(f"screencap -p {remote}")
         if output is None:
             output = Path(tempfile.mktemp(suffix=".png"))
-        return self._adb.pull(remote, Path(output))
+        local = self._adb.pull(remote, Path(output))
+        if _png_is_fully_transparent(local):
+            try:
+                return self._adb.emulator_screenshot(local)
+            except AdbError:
+                return local
+        return local
 
     def tap(self, x: int, y: int) -> None:
         """Tap at screen coordinates."""
@@ -215,3 +223,94 @@ class NativeAdb:
                 w, h = size.split("x")
                 return {"width": int(w), "height": int(h)}
         return {"width": 0, "height": 0}
+
+
+def _png_is_fully_transparent(path: str | Path) -> bool:
+    """Return True for 8-bit RGBA PNGs whose alpha channel is all zero."""
+    try:
+        raw = Path(path).read_bytes()
+        width, height, color_type, bit_depth, interlace, idat = _parse_png(raw)
+        if color_type != 6 or bit_depth != 8 or interlace != 0:
+            return False
+        data = zlib.decompress(idat)
+        row_len = width * 4
+        pos = 0
+        prev = bytes(row_len)
+        for _ in range(height):
+            filter_type = data[pos]
+            pos += 1
+            row = bytearray(data[pos:pos + row_len])
+            pos += row_len
+            _unfilter_png_row(row, prev, 4, filter_type)
+            if any(alpha != 0 for alpha in row[3::4]):
+                return False
+            prev = bytes(row)
+        return True
+    except Exception:
+        return False
+
+
+def _parse_png(raw: bytes) -> tuple[int, int, int, int, int, bytes]:
+    signature = b"\x89PNG\r\n\x1a\n"
+    if not raw.startswith(signature):
+        raise ValueError("not a png")
+
+    pos = len(signature)
+    width = height = color_type = bit_depth = interlace = None
+    idat_parts: list[bytes] = []
+    while pos + 8 <= len(raw):
+        length = struct.unpack(">I", raw[pos:pos + 4])[0]
+        chunk_type = raw[pos + 4:pos + 8]
+        pos += 8
+        chunk = raw[pos:pos + length]
+        pos += length + 4  # skip data and CRC
+
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", chunk)
+        elif chunk_type == b"IDAT":
+            idat_parts.append(chunk)
+        elif chunk_type == b"IEND":
+            break
+
+    if width is None or height is None:
+        raise ValueError("png missing IHDR")
+    return width, height, color_type, bit_depth, interlace, b"".join(idat_parts)
+
+
+def _unfilter_png_row(row: bytearray, prev: bytes, bpp: int, filter_type: int) -> None:
+    if filter_type == 0:
+        return
+    if filter_type == 1:
+        for i in range(len(row)):
+            row[i] = (row[i] + (row[i - bpp] if i >= bpp else 0)) & 0xFF
+        return
+    if filter_type == 2:
+        for i in range(len(row)):
+            row[i] = (row[i] + prev[i]) & 0xFF
+        return
+    if filter_type == 3:
+        for i in range(len(row)):
+            left = row[i - bpp] if i >= bpp else 0
+            up = prev[i]
+            row[i] = (row[i] + ((left + up) // 2)) & 0xFF
+        return
+    if filter_type == 4:
+        for i in range(len(row)):
+            left = row[i - bpp] if i >= bpp else 0
+            up = prev[i]
+            up_left = prev[i - bpp] if i >= bpp else 0
+            row[i] = (row[i] + _paeth_predictor(left, up, up_left)) & 0xFF
+        return
+    raise ValueError(f"unsupported PNG filter: {filter_type}")
+
+
+def _paeth_predictor(left: int, up: int, up_left: int) -> int:
+    p = left + up - up_left
+    pa = abs(p - left)
+    pb = abs(p - up)
+    pc = abs(p - up_left)
+    if pa <= pb and pa <= pc:
+        return left
+    if pb <= pc:
+        return up
+    return up_left

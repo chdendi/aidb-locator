@@ -91,6 +91,59 @@ def test_screenshot_returns_png(client, monkeypatch, tmp_path):
     assert resp.content == png_bytes
 
 
+def test_snapshot_deletes_screenshot_file(client, monkeypatch, tmp_path):
+    png_file = tmp_path / "shot.png"
+    png_file.write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
+    monkeypatch.setattr(
+        "aidb_locator.ui.api.snapshot.CodeLocator.grab_layout",
+        lambda self: _fake_app(),
+    )
+    monkeypatch.setattr(
+        "aidb_locator.ui.api.snapshot.NativeAdb.screenshot",
+        lambda self, output=None: png_file,
+    )
+
+    resp = client.get("/api/snapshot")
+    assert resp.status_code == 200
+    assert not png_file.exists()
+
+
+def test_snapshot_deletes_screenshot_when_layout_fails(client, monkeypatch, tmp_path):
+    png_file = tmp_path / "shot.png"
+    png_file.write_bytes(b"\x89PNG\r\n\x1a\nFAKE")
+
+    def boom(self):
+        raise RuntimeError("layout failed")
+
+    monkeypatch.setattr("aidb_locator.ui.api.snapshot.CodeLocator.grab_layout", boom)
+    monkeypatch.setattr(
+        "aidb_locator.ui.api.snapshot.NativeAdb.screenshot",
+        lambda self, output=None: png_file,
+    )
+
+    try:
+        client.get("/api/snapshot")
+        assert False, "layout failure should surface"
+    except RuntimeError as e:
+        assert "layout failed" in str(e)
+    assert not png_file.exists()
+
+
+def test_screenshot_endpoint_deletes_file(client, monkeypatch, tmp_path):
+    png_bytes = b"\x89PNG\r\n\x1a\nDATA"
+    png_file = tmp_path / "s.png"
+    png_file.write_bytes(png_bytes)
+    monkeypatch.setattr(
+        "aidb_locator.ui.api.snapshot.NativeAdb.screenshot",
+        lambda self, output=None: png_file,
+    )
+
+    resp = client.get("/api/screenshot")
+    assert resp.status_code == 200
+    assert resp.content == png_bytes
+    assert not png_file.exists()
+
+
 def test_layout_returns_tree(client, monkeypatch):
     monkeypatch.setattr(
         "aidb_locator.ui.api.snapshot.CodeLocator.grab_layout",

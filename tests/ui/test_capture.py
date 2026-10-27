@@ -11,4 +11,6 @@ def test_capture_returns_png(client, monkeypatch, tmp_path):
     resp = client.get("/api/capture/abc123")
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("image/png")
+    assert resp.headers["content-disposition"] == 'attachment; filename="view_abc123.png"'
     assert resp.content == png_bytes
+    assert not png_file.exists()

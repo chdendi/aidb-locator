@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import shlex
 import subprocess
 from unittest.mock import patch, MagicMock
 
-from aidb_locator.adb import AdbClient, AdbError, Device
+from aidb_locator.adb import AdbClient, AdbError, Device, shell_join
+from aidb_locator.protocol import ACTION_LAYOUT_INFO, build_broadcast_command
 
 
 class TestAdbClientBuildCmd:
@@ -84,3 +86,53 @@ class TestEmulatorScreenshot:
         assert result == output
         args = mock_run.call_args[0][0]
         assert args == ["adb", "emu", "screenrecord", "screenshot", str(output)]
+
+
+class TestShellJoin:
+    def test_leaves_codelocator_safe_tokens_unquoted(self):
+        args = build_broadcast_command(
+            ACTION_LAYOUT_INFO,
+            {"name": "value with spaces and 'quotes'"},
+        )
+        joined = shell_join(args)
+        # Base64 extras and action names sit in shlex's safe set, so the
+        # command matches a plain join and stays compatible with CodeLocator.
+        assert joined == " ".join(args)
+        assert "'" not in joined
+        assert joined.startswith(
+            "am broadcast -a com.bytedance.tools.codelocator.action_debug_layout_info "
+            "--es codeLocator_shell_args "
+        )
+
+    def test_quotes_spaces_quotes_and_metacharacters(self):
+        assert shell_join(["input", "text", "hello%sworld"]) == "input text hello%sworld"
+        assert shell_join(["echo", "it's"]) == "echo " + shlex.quote("it's")
+        assert shell_join(["echo", "a b"]) == "echo 'a b'"
+        assert shell_join(["echo", "a;rm"]) == "echo 'a;rm'"
+        assert shell_join(["echo", "$(id)"]) == "echo '$(id)'"
+        assert shell_join(["echo", ""]) == "echo ''"
+
+
+class TestBroadcastQuoting:
+    @patch("aidb_locator.adb.subprocess.run")
+    def test_codelocator_broadcast_command_shape(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n", stderr="")
+        args = {"k": "value with spaces and 'quotes'"}
+        client = AdbClient()
+        client.broadcast(ACTION_LAYOUT_INFO, args)
+
+        cmd = mock_run.call_args[0][0]
+        shell_args = build_broadcast_command(ACTION_LAYOUT_INFO, args)
+        assert cmd[:2] == ["adb", "shell"]
+        assert cmd[2] == shell_join(shell_args)
+        assert cmd[2] == " ".join(shell_args)
+        assert mock_run.call_args.kwargs["timeout"] == 30
+
+    @patch("aidb_locator.adb.subprocess.run")
+    def test_unsafe_action_is_quoted(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="ok\n", stderr="")
+        client = AdbClient()
+        client.broadcast("bad;rm -rf", None)
+        shell = mock_run.call_args[0][0][2]
+        assert shell == shell_join(["am", "broadcast", "-a", "bad;rm -rf"])
+        assert "'bad;rm -rf'" in shell

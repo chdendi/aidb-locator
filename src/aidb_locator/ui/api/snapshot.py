@@ -7,7 +7,7 @@ import base64
 from pathlib import Path
 
 from fastapi import APIRouter, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 
 from aidb_locator.commands import CodeLocator, NativeAdb
 from aidb_locator.models import WApplication, WView
@@ -79,11 +79,29 @@ async def snapshot(device: str | None = Query(default=None)) -> dict:
     cl = make_codelocator(device)
     nat = make_native(device)
 
-    layout_task = asyncio.to_thread(cl.grab_layout)
-    shot_task = asyncio.to_thread(nat.screenshot)
-    app, png_path = await asyncio.gather(layout_task, shot_task)
+    # Wait for both calls so a layout failure still leaves the screenshot path
+    # available for cleanup. screenshot() deletes its own temp file if capture fails.
+    layout_result, shot_result = await asyncio.gather(
+        asyncio.to_thread(cl.grab_layout),
+        asyncio.to_thread(nat.screenshot),
+        return_exceptions=True,
+    )
+    png_path = None if isinstance(shot_result, BaseException) else Path(shot_result)
+    try:
+        if isinstance(layout_result, BaseException):
+            if isinstance(shot_result, BaseException):
+                raise layout_result from shot_result
+            raise layout_result
+        if isinstance(shot_result, BaseException):
+            raise shot_result
+        if png_path is None:
+            raise RuntimeError("screenshot path missing")
+        png_bytes = png_path.read_bytes()
+    finally:
+        if png_path is not None:
+            png_path.unlink(missing_ok=True)
 
-    png_bytes = Path(png_path).read_bytes()
+    app = layout_result
     root = _root_view(app)
     return {
         "screenshot_png_b64": base64.b64encode(png_bytes).decode("ascii"),
@@ -96,9 +114,13 @@ async def snapshot(device: str | None = Query(default=None)) -> dict:
 
 
 @router.get("/screenshot")
-def screenshot_png(device: str | None = Query(default=None)) -> FileResponse:
-    path = make_native(device).screenshot()
-    return FileResponse(path, media_type="image/png")
+def screenshot_png(device: str | None = Query(default=None)) -> Response:
+    path = Path(make_native(device).screenshot())
+    try:
+        data = path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
+    return Response(content=data, media_type="image/png")
 
 
 @router.get("/layout")

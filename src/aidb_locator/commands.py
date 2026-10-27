@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import tempfile
 import zlib
 from pathlib import Path
 
-from aidb_locator.adb import AdbClient, AdbError
+from aidb_locator.adb import AdbClient, AdbError, shell_join
 from aidb_locator.models import (
     WApplication,
     WFile,
@@ -53,9 +54,11 @@ class CodeLocator:
             return {"code": -1, "msg": "No data in response"}
 
         if is_file:
-            with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
-                local = self._adb.pull(data_str, tmp.name)
-                content = local.read_bytes()
+            local = _temporary_path(".txt")
+            try:
+                content = self._adb.pull(data_str, local).read_bytes()
+            finally:
+                local.unlink(missing_ok=True)
             return decode_file_result(content)
 
         return decode_inline_result(data_str)
@@ -119,14 +122,26 @@ class CodeLocator:
         })
 
     def capture_view(self, view_mem_addr: str, output: str | Path | None = None) -> Path:
-        """Capture a View's rendered bitmap."""
+        """Capture a View's rendered bitmap.
+
+        When ``output`` is omitted, the PNG is written to a secure temporary
+        file. The caller owns that file and must delete it after reading.
+        """
         operate_data = self._build_operate_data(view_mem_addr, EDIT_VIEW_BITMAP)
         self._send(ACTION_CHANGE_VIEW, {KEY_CHANGE_VIEW: operate_data})
 
-        if output is None:
-            output = Path(tempfile.mktemp(suffix=".png"))
+        owned_temp = output is None
+        if owned_temp:
+            output = _temporary_path(".png")
         output = Path(output)
-        return self._adb.pull(RESULT_IMAGE_PATH, output)
+        delivered = False
+        try:
+            local = self._adb.pull(RESULT_IMAGE_PATH, output)
+            delivered = True
+            return local
+        finally:
+            if owned_temp and not delivered:
+                output.unlink(missing_ok=True)
 
     def get_view_data(self, view_mem_addr: str) -> dict:
         """Get data bound to a View."""
@@ -154,50 +169,74 @@ class NativeAdb:
         self._adb = adb
 
     def screenshot(self, output: str | Path | None = None) -> Path:
-        """Take a full-screen screenshot."""
+        """Take a full-screen screenshot.
+
+        When ``output`` is omitted, the PNG is written to a secure temporary
+        file. The caller owns that file and must delete it after reading.
+        """
         remote = "/sdcard/aidb_screenshot.png"
-        if output is None:
-            output = Path(tempfile.mktemp(suffix=".png"))
+        owned_temp = output is None
+        if owned_temp:
+            output = _temporary_path(".png")
         output = Path(output)
+        delivered = False
         try:
-            self._adb.shell(f"screencap -p {remote}")
-        except AdbError as original:
             try:
-                return self._adb.emulator_screenshot(output)
-            except AdbError:
-                raise original
-        local = self._adb.pull(remote, output)
-        if _png_is_fully_transparent(local):
-            try:
-                return self._adb.emulator_screenshot(local)
-            except AdbError:
-                return local
-        return local
+                self._adb.shell(shell_join(["screencap", "-p", remote]))
+            except AdbError as original:
+                try:
+                    result = self._adb.emulator_screenshot(output)
+                except AdbError:
+                    raise original
+                delivered = True
+                return result
+            local = self._adb.pull(remote, output)
+            if _png_is_fully_transparent(local):
+                try:
+                    result = self._adb.emulator_screenshot(local)
+                except AdbError:
+                    delivered = True
+                    return local
+                delivered = True
+                return result
+            delivered = True
+            return local
+        finally:
+            if owned_temp and not delivered:
+                output.unlink(missing_ok=True)
 
     def tap(self, x: int, y: int) -> None:
         """Tap at screen coordinates."""
-        self._adb.shell(f"input tap {x} {y}")
+        self._adb.shell(shell_join(["input", "tap", x, y]))
 
     def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
         """Swipe from (x1,y1) to (x2,y2)."""
-        self._adb.shell(f"input swipe {x1} {y1} {x2} {y2} {duration_ms}")
+        self._adb.shell(shell_join(["input", "swipe", x1, y1, x2, y2, duration_ms]))
 
     def input_text(self, text: str) -> None:
-        """Input text (ASCII only)."""
-        escaped = text.replace(" ", "%s").replace("&", "\\&").replace("<", "\\<").replace(">", "\\>")
-        self._adb.shell(f"input text '{escaped}'")
+        """Input text (ASCII only).
+
+        Spaces are encoded as ``%s`` because Android's ``input text`` treats
+        that sequence as a space. The value is then shell-quoted so quotes
+        and metacharacters cannot break ``adb shell``.
+        """
+        encoded = text.replace(" ", "%s")
+        self._adb.shell(shell_join(["input", "text", encoded]))
 
     def input_keyevent(self, keycode: int | str) -> None:
         """Send a key event (e.g., 3=HOME, 4=BACK, 24=VOLUME_UP)."""
-        self._adb.shell(f"input keyevent {keycode}")
+        self._adb.shell(shell_join(["input", "keyevent", keycode]))
 
     def dump_ui(self) -> str:
         """Dump UI hierarchy via uiautomator (no SDK needed)."""
         remote = "/sdcard/aidb_uidump.xml"
-        self._adb.shell(f"uiautomator dump {remote}")
-        local = Path(tempfile.mktemp(suffix=".xml"))
-        self._adb.pull(remote, local)
-        return local.read_text(encoding="utf-8")
+        self._adb.shell(shell_join(["uiautomator", "dump", remote]))
+        local = _temporary_path(".xml")
+        try:
+            self._adb.pull(remote, local)
+            return local.read_text(encoding="utf-8")
+        finally:
+            local.unlink(missing_ok=True)
 
     def top_activity(self) -> dict:
         """Get the current top activity info."""
@@ -218,7 +257,7 @@ class NativeAdb:
     def open_deeplink(self, url: str) -> str:
         """Open a deep link via am start."""
         return self._adb.shell(
-            f"am start -a android.intent.action.VIEW -d '{url}'"
+            shell_join(["am", "start", "-a", "android.intent.action.VIEW", "-d", url])
         )
 
     def screen_size(self) -> dict:
@@ -230,6 +269,17 @@ class NativeAdb:
                 w, h = size.split("x")
                 return {"width": int(w), "height": int(h)}
         return {"width": 0, "height": 0}
+
+
+def _temporary_path(suffix: str) -> Path:
+    """Create a secure temporary file and return its path.
+
+    ``tempfile.mktemp()`` is deprecated and race-prone. ``mkstemp`` creates
+    the file with ``O_EXCL``. The caller owns the file and must unlink it.
+    """
+    fd, name = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return Path(name)
 
 
 def _png_is_fully_transparent(path: str | Path) -> bool:

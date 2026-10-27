@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def shell_join(args: list[object]) -> str:
+    """Quote and join arguments for a remote ``adb shell`` command.
+
+    ``shlex.quote`` keeps spaces, single quotes, and shell metacharacters
+    from breaking the remote shell or injecting extra commands. Tokens in
+    the POSIX safe set — including CodeLocator's Base64 broadcast extras —
+    stay unquoted, so those commands keep their existing shape.
+    """
+    return " ".join(shlex.quote(str(arg)) for arg in args)
 
 
 class AdbError(Exception):
@@ -58,8 +70,7 @@ class AdbClient:
         from aidb_locator.protocol import build_broadcast_command
 
         shell_args = build_broadcast_command(action, args)
-        shell_cmd = " ".join(f"'{a}'" if " " in a else a for a in shell_args)
-        return self._run(["shell", shell_cmd], timeout=30)
+        return self._run(["shell", shell_join(shell_args)], timeout=30)
 
     def pull(self, remote_path: str, local_path: str | Path) -> Path:
         """Pull a file from device to local path."""

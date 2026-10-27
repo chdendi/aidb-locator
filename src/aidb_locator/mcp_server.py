@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -278,9 +279,11 @@ def run_server(device_serial: str | None = None):
                 return [TextContent(type="text", text=json.dumps({"success": ok}))]
 
             elif name == "aidb_capture_view":
-                path = locator.capture_view(arguments["view_mem_addr"])
-                with open(path, "rb") as f:
-                    img_data = base64.b64encode(f.read()).decode("ascii")
+                path = Path(locator.capture_view(arguments["view_mem_addr"]))
+                try:
+                    img_data = base64.b64encode(path.read_bytes()).decode("ascii")
+                finally:
+                    path.unlink(missing_ok=True)
                 return [ImageContent(type="image", data=img_data, mimeType="image/png")]
 
             elif name == "aidb_get_view_data":
@@ -294,9 +297,11 @@ def run_server(device_serial: str | None = None):
             # --- Native ADB tools ---
             elif name == "aidb_screenshot":
                 native = _make_native(arguments, device_serial)
-                path = native.screenshot()
-                with open(path, "rb") as f:
-                    img_data = base64.b64encode(f.read()).decode("ascii")
+                path = Path(native.screenshot())
+                try:
+                    img_data = base64.b64encode(path.read_bytes()).decode("ascii")
+                finally:
+                    path.unlink(missing_ok=True)
                 return [ImageContent(type="image", data=img_data, mimeType="image/png")]
 
             elif name == "aidb_tap":
